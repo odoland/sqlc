@@ -347,6 +347,7 @@ func isTableRequired(n ast.Node, col *Column, prior int) int {
 // Return an error if an unknown column is referenced
 func sourceTables(qc *QueryCatalog, node ast.Node) ([]*Table, error) {
 	var list *ast.List
+	var tempTables []*Table
 	switch n := node.(type) {
 	case *ast.DeleteStmt:
 		list = &ast.List{
@@ -357,14 +358,52 @@ func sourceTables(qc *QueryCatalog, node ast.Node) ([]*Table, error) {
 			Items: []ast.Node{n.Relation},
 		}
 	case *ast.SelectStmt:
+		// PostgreSQL allows a function call to be written as a member from the FROM list
+		// ex: FROM UNNEST(...) as temp(things)
+		// This captures this case and inserts it as a sourceTable
+		// for the column look up.
+		type temp struct {
+			alias    *ast.Alias
+			typeName *ast.TypeName
+		}
+		var functionCallInFROM bool
+		var temptbl temp
+
 		list = astutils.Search(n.FromClause, func(node ast.Node) bool {
 			switch node.(type) {
-			case *ast.RangeVar, *ast.RangeSubselect, *ast.FuncName:
+			case *ast.RangeVar, *ast.RangeSubselect:
 				return true
+			case *ast.TypeName:
+				temptbl.typeName = node.(*ast.TypeName)
+				return false
+			case *ast.FuncName:
+				functionCallInFROM = true
+				return false
+			case *ast.Alias:
+				temptbl.alias = node.(*ast.Alias)
+				return false
 			default:
 				return false
 			}
 		})
+		// Link the alias table name + column names of the FROM function call
+		// so that the columns can be used in the SELECT statement.
+		if functionCallInFROM && temptbl.alias != nil {
+			cols := []*Column{}
+			for _, item := range temptbl.alias.Colnames.Items {
+				col := toColumn(temptbl.typeName)
+				name := item.(*ast.String)
+				col.Name = name.Str
+				col.IsArray = false
+				cols = append(cols, col)
+			}
+			tempTables = append(tempTables, &Table{
+				Rel: &ast.TableName{
+					Name: *temptbl.alias.Aliasname,
+				},
+				Columns: cols,
+			})
+		}
 	case *ast.TruncateStmt:
 		list = astutils.Search(n.Relations, func(node ast.Node) bool {
 			_, ok := node.(*ast.RangeVar)
@@ -379,6 +418,7 @@ func sourceTables(qc *QueryCatalog, node ast.Node) ([]*Table, error) {
 	}
 
 	var tables []*Table
+	tables = append(tables, tempTables...)
 	for _, item := range list.Items {
 		switch n := item.(type) {
 
